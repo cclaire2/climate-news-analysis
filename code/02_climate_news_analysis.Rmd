@@ -1,0 +1,890 @@
+---
+title: "188C_final_project"
+author: "Jiayao(Claire) Liu"
+date: "2026-05-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## FINAL PROJECT - PARTS 3 & 4
+
+- Dataset: `final_weather_8media.csv`
+- `cc_segment` column: cc_segment
+- Outlet column: channelTitle
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidytext)
+library(textstem)
+library(tm)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(readr)
+library(stopwords)
+library(topicmodels)
+library(sentimentr)
+library(purrr)
+```
+
+# STEP 1 - Data Preparation
+
+OPTIONAL: to present all the prep works for data collection and cleaning.
+
+### Load Data
+
+```{r load-data, message=FALSE}
+# Reading the dataset
+df_raw <- read_csv("final_weather_8media.csv")
+
+cat("Articles per outlet after grouping:\n")
+print(table(df_raw$channelTitle))
+```
+
+Filter to English-language weather video transcripts only.
+
+```{r filter-english}
+df <- df_raw %>%
+  filter(
+    str_detect(cc_segment, "[a-zA-Z]"),  # has Latin cc_segment
+    str_count(cc_segment, "[a-zA-Z]") /
+      str_count(cc_segment, ".") > 0.7   # >70% Latin chars
+  )
+
+cat("\nAfter filtering non-English:", nrow(df), "articles remain\n")
+
+# Give each article a unique doc ID
+df <- df %>% mutate(doc_id = row_number())
+```
+
+- Eliminating non-English content and video translation artifacts by dropping any segment where less than 70% of the text consists of standard characters. We also create a unique doc_id per record.
+- Cleaning this ensures that foreign language words do not corrupt our final text representation models.
+
+# STEP 2 - TEXT PREPROCESSING
+
+```{r text-preprocessing}
+data("stop_words") # tidytext stop words
+
+# Define custom transcript noise words
+my_stop_words <- tibble(word = c("uh", "um", "have", "people", "like", "just", "say",
+                                  "know", "going", "think", "really", "right", "ve", "lot", "n't"))
+
+tidy_tokens <- df %>%
+  # Tokenize + lowercase + strip punctuation
+  unnest_tokens(word, cc_segment) %>%
+  # Strip any remaining non-alpha characters (HTML artifacts, numbers)
+  mutate(word = str_remove_all(word, "[^a-z]")) %>%
+  # Drop empty strings and single characters
+  filter(nchar(word) > 1) %>%
+  # Remove standard stop words
+  anti_join(stop_words, by = "word") %>%
+  # Remove custom transcript stop words (FIXED: chained sequentially instead of overwriting)
+  anti_join(my_stop_words, by = "word") %>%
+  # Lemmatize (normalizes: flooding -> flood, temperatures -> temperature)
+  mutate(word = lemmatize_words(word))
+
+cat("\nTokens after cleaning:", nrow(tidy_tokens))
+cat("\nUnique lemmas: ", n_distinct(tidy_tokens$word), "\n")
+
+# Inspect final top 20 lemmas
+tidy_tokens %>%
+  count(word, sort = TRUE) %>%
+  head(20) %>%
+  print()
+```
+
+For text preprocessing, we tokenized the transcripts, removed stop words and filler words, and lemmatized everything to base form. Then we calculated TF-IDF at the channel level, which tells us which words are most distinctive to each channel — not most climate-related, but most unique. We used quantile thresholds to sort words into four tiers. The actual climate relevance is measured in the next step using keyword matching.
+
+# STEP 3 - TF-IDF
+
+```{r tfidf-thresholds}
+token_counts_clean <- tidy_tokens %>%
+  filter(!str_detect(word, "^[0-9]+$")) %>%
+  count(channelTitle, word, name = "n") %>%
+  group_by(word) %>%
+  filter(sum(n) > 1) %>%
+  ungroup()
+
+tfidf_df <- token_counts_clean %>%
+  bind_tf_idf(term = word, document = channelTitle, n = n)
+
+# 2. Define the 4 Thresholds using Quantiles
+non_zero_tfidf <- tfidf_df$tf_idf[tfidf_df$tf_idf > 0]
+thresh_vals <- quantile(non_zero_tfidf, probs = c(0.25, 0.50, 0.75, 0.95), na.rm = TRUE)
+
+cat("\n-- Calculated TF-IDF Thresholds --\n")
+print(thresh_vals)
+```
+
+We calculated TF-IDF scores using each channel as the document unit, so TF-IDF measures how distinctive a word is to a particular channel compared to the others. We then used quantile thresholds at the 25th, 50th, 75th, and 95th percentiles to objectively segment words into importance tiers. A high TF-IDF score means a word appears frequently in one channel but rarely in the others — it measures uniqueness, not necessarily climate relevance.
+
+```{r tfidf-tiers}
+# Categorize words into 4 tiers based on quantile thresholds
+tfidf_categorized <- tfidf_df %>%
+  mutate(
+    attribution_tier = case_when(
+      tf_idf >= thresh_vals[4] ~ "Tier 1 (95th+ Pct)",
+      tf_idf >= thresh_vals[3] ~ "Tier 2 (75th-95th Pct)",
+      tf_idf >= thresh_vals[2] ~ "Tier 3 (50th-75th Pct)",
+      tf_idf >= thresh_vals[1] ~ "Tier 4 (25th-50th Pct)",
+      TRUE ~ "Below 25th Pct"
+    )
+  )
+
+# Top 5 terms per tier per channel
+top_terms_segmented <- tfidf_categorized %>%
+  filter(attribution_tier != "Below 25th Pct") %>%
+  group_by(channelTitle, attribution_tier) %>%
+  slice_max(tf_idf, n = 5, with_ties = FALSE) %>%
+  arrange(channelTitle, attribution_tier, desc(tf_idf))
+
+cat("\n-- Top Terms by Threshold Tier --\n")
+print(top_terms_segmented, n = Inf)
+```
+
+We sorted each word into one of four tiers based on its TF-IDF score. Tier 1 contains the most distinctive words for each channel — those in the 95th percentile or above. This tells us what vocabulary makes each channel's coverage unique. It does not measure how related a word is to climate; keyword-based attribution scoring is handled separately in Step 4.
+
+### Plot 1: TF-IDF
+
+```{r plot-tfidf, fig.width=12, fig.height=9}
+## Plot
+top_terms_segmented %>%
+  group_by(channelTitle) %>%
+  slice_max(tf_idf, n = 8, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, tf_idf, channelTitle)) %>%
+  ggplot(aes(tf_idf, word, fill = channelTitle)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ channelTitle, scales = "free_y", ncol = 2) +
+  scale_y_reordered() +
+  labs(
+    title = "Top TF-IDF Terms by Outlet Channel",
+    subtitle = "TF-IDF score per channel",
+    x = "TF-IDF",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank()
+  )
+
+# ggsave("tfidf_by_outlet.png", width = 12, height = 9, dpi = 150)
+```
+
+This plot shows the top TF-IDF words for each channel. Each word is most unique to that channel compared to the others. Unlike the frequency plot, these are not the most common words, but the most distinctive ones. As we can see, the top words are mostly anchor names, reporter names, and network branding — like 'ginger' for ABC News and 'gillian' for Fox News. Climate and weather terms are absent here because all channels share that vocabulary, so TF-IDF assigns those words low scores. This tells us that what distinguishes each channel's coverage is not the weather content itself, but who delivers it.
+
+### Plot 2: Top 5 most frequent words
+
+```{r plot-top-words, fig.width=12, fig.height=9}
+# Top 5 most frequent words PER channel
+top_words_by_channel <- tidy_tokens %>%
+  count(channelTitle, word, sort = TRUE) %>%
+  group_by(channelTitle) %>%
+  slice_max(n, n = 5, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, n, channelTitle))
+
+ggplot(top_words_by_channel, aes(x = n, y = word, fill = channelTitle)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ channelTitle, scales = "free_y", ncol = 2) +
+  scale_y_reordered() +
+  labs(
+    title = "Top 5 Most Frequent Words by Channel",
+    subtitle = "Shared weather/climate vocabulary across all channels",
+    x = "Frequency",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave("top_words_by_channel.png", width = 12, height = 9, dpi = 150)
+```
+
+This plot shows the top 5 most frequently used words for each channel. As we can see, the most common words are largely the same across all eight channels — terms like 'weather', 'storm', 'water', 'wind', and 'fire' appear repeatedly. This confirms two things: first, our data collection was valid because all transcripts are clearly weather-related. Second, it explains why these words don't appear in the TF-IDF results — since every channel uses them, TF-IDF treats them as non-distinctive and assigns them low scores.
+
+# STEP 4 - CLIMATE ATTRIBUTION SCORING
+
+Climate and Weather keywords:
+
+```{r keywords}
+climate_keywords <- c(
+  "climate change", "global warming", "greenhouse gas",
+  "carbon emission", "climate crisis", "climate science",
+  "carbon dioxide", "fossil fuel", "sea level rise",
+  "temperature rise", "paris agreement", "climate model",
+  "decarbonization", "carbon neutral", "renewable energy",
+  "climate", "warming", "emissions"
+)
+
+weather_keywords <- c(
+  "wildfire", "heatwave", "heat wave", "extreme heat",
+  "hurricane", "flooding", "flood", "drought",
+  "tornado", "storm surge", "extreme weather",
+  "storm", "cyclone", "blizzard", "typhoon"
+)
+```
+
+### Attribution Scoring
+
+- `climate_hits`: count of climate keywords mentioned in each video transcript
+- `weather_hits`: count of weather keywords mentioned in each video transcript
+- `attribution_score` = climate_hits * weather_hits
+- `attr_score_norm` = attribution_score ÷ word_count × 100 (handles the effect of transcript length)
+
+```{r attribution-scoring}
+count_kw <- function(text, keywords) {
+  text_lower <- tolower(text)
+  sum(sapply(keywords, function(kw) str_count(text_lower, fixed(kw))))
+}
+
+# Apply metrics to every article row-by-row matching original column names
+scored_df <- df %>%
+  rowwise() %>%
+  mutate(
+    climate_hits = count_kw(cc_segment, climate_keywords),
+    weather_hits = count_kw(cc_segment, weather_keywords),
+    # Co-occurrence interaction score
+    attribution_score = climate_hits * weather_hits,
+    # Controlling for length
+    word_count = str_count(cc_segment, "\\S+"),
+    attr_score_norm = round(attribution_score / word_count * 100, 3)
+  ) %>%
+  ungroup()
+
+attribution_summary <- scored_df %>%
+  group_by(channelTitle) %>%
+  summarise(
+    n_articles = n(),
+    mean_climate_hits = round(mean(climate_hits), 2),
+    mean_weather_hits = round(mean(weather_hits), 2),
+    mean_attr_score = round(mean(attribution_score), 2),
+    mean_attr_norm = round(mean(attr_score_norm), 3),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_attr_score))
+
+cat("\n-- Climate Attribution Summary by Outlet Channel --\n")
+print(attribution_summary)
+
+# Per-article verification view
+cat("\n-- Top 15 Articles by Attribution Score --\n")
+scored_df %>%
+  select(channelTitle, title, climate_hits, weather_hits, attribution_score, attr_score_norm) %>%
+  arrange(desc(attribution_score)) %>%
+  head(15) %>%
+  print()
+```
+
+For each article, we counted how many climate keywords and weather keywords appeared. The attribution score is the product of the two, so an article only gets a score above zero if it mentions both climate and extreme weather terms. This captures whether the article explicitly links weather events to climate change. We also normalized by article length to ensure longer articles don't get inflated scores.
+
+### Plot 1: Boxplot of Attribution Scores
+
+```{r plot-attribution-boxplot, fig.width=10, fig.height=6}
+scored_df %>%
+  ggplot(aes(x = reorder(channelTitle, attribution_score, median),
+             y = attribution_score, fill = channelTitle)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = channelTitle), width = 0.18, size = 2, alpha = 0.5) +
+  coord_flip() +
+  labs(
+    title = "Climate Attribution Score Distribution by Channel",
+    subtitle = "Score = (climate hits) * (extreme weather hits)",
+    x = NULL,
+    y = "Attribution Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank()
+  )
+
+ggsave("attribution_boxplot.png", width = 10, height = 6, dpi = 150)
+```
+
+### Plot 2: Climate Hits vs Weather Hits Scatter
+
+```{r plot-climate-weather-scatter, fig.width=10, fig.height=6}
+scored_df %>%
+  ggplot(aes(x = climate_hits, y = weather_hits, color = channelTitle)) +
+  geom_point(size = 3, alpha = 0.6) +
+  labs(
+    title    = "Climate vs. Extreme Weather Keyword Co-occurrence",
+    subtitle = "Upper-right quadrant displays strongest structural attribution framing",
+    x        = "Climate Keyword Hits",
+    y        = "Extreme Weather Keyword Hits",
+    color    = "Channel"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave("climate_weather_scatter.png", width = 10, height = 6, dpi = 150)
+```
+
+### Plot 3: Mean Attribution Score Bar Chart
+
+```{r plot-mean-attribution-bar, fig.width=9, fig.height=6}
+attribution_summary %>%
+  ggplot(aes(x = reorder(channelTitle, mean_attr_score),
+             y = mean_attr_score, fill = channelTitle)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = round(mean_attr_score, 1)),
+            hjust = -0.2, size = 4) +
+  coord_flip() +
+  expand_limits(y = max(attribution_summary$mean_attr_score) * 1.15) +
+  labs(
+    title    = "Mean Climate Attribution Score by Channel",
+    subtitle = "Higher indicates systematic linking of weather events to climate patterns",
+    x        = NULL,
+    y        = "Mean Attribution Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position   = "none",
+    plot.title        = element_text(face = "bold"),
+    panel.grid.major.y = element_blank()
+  )
+
+ggsave("attribution_bar.png", width = 9, height = 6, dpi = 150)
+```
+
+### Plot 4: Attribution Rate
+
+```{r attribution-rate, fig.width=9, fig.height=6}
+attribution_rate <- scored_df %>%
+  mutate(climate_attributed = ifelse(attribution_score > 0, 1, 0)) %>%
+  group_by(channelTitle) %>%
+  summarise(
+    n_articles = n(),
+    n_attributed = sum(climate_attributed),
+    attribution_rate = round(n_attributed / n_articles * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(attribution_rate))
+
+cat("\n-- Climate Attribution Rate by Outlet --\n")
+print(attribution_rate)
+
+# Plot: Attribution rate bar chart
+ggplot(attribution_rate,
+       aes(x = reorder(channelTitle, attribution_rate),
+           y = attribution_rate, fill = channelTitle)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = paste0(attribution_rate, "%")),
+            hjust = -0.2, size = 4) +
+  coord_flip() +
+  expand_limits(y = 110) +
+  labs(
+    title = "Climate Attribution Rate by Outlet",
+    subtitle = "% of articles that explicitly link extreme weather to climate change",
+    x = NULL, y = "Attribution Rate (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+ggsave("attribution_rate_by_outlet.png", width = 9, height = 6, dpi = 150)
+```
+
+# STEP 5 - TOPIC MODELING
+
+```{r step5-reproduce-preprocessing, message=FALSE}
+# 5.0 - REPRODUCE PART 3 & 4 PREPROCESSING
+df_raw <- read_csv("final_weather_8media.csv")
+
+df <- df_raw %>%
+  filter(
+    str_detect(cc_segment, "[a-zA-Z]"),
+    str_count(cc_segment, "[a-zA-Z]") /
+      str_count(cc_segment, ".") > 0.7
+  ) %>%
+  mutate(doc_id = row_number())
+
+cat("Articles per outlet after cleaning:", nrow(df), "\n")
+print(table(df$channelTitle))
+
+data("stop_words")
+my_stop_words <- tibble(word = c(
+  "uh", "um", "have", "people", "like", "just", "say",
+  "know", "going", "think", "really", "right", "ve",
+  "lot", "n't"
+))
+
+tidy_tokens <- df %>%
+  unnest_tokens(word, cc_segment) %>%
+  mutate(word = str_remove_all(word, "[^a-z]")) %>%
+  filter(nchar(word) > 1) %>%
+  anti_join(stop_words, by = "word") %>%
+  anti_join(my_stop_words, by = "word") %>%
+  mutate(word = lemmatize_words(word))
+
+climate_keywords <- c(
+  "climate change", "global warming", "greenhouse gas",
+  "carbon emission", "climate crisis", "climate science",
+  "carbon dioxide", "fossil fuel", "sea level rise",
+  "temperature rise", "paris agreement", "climate model",
+  "decarbonization", "carbon neutral", "renewable energy",
+  "climate", "warming", "emissions"
+)
+
+weather_keywords <- c(
+  "wildfire", "heatwave", "heat wave", "extreme heat",
+  "hurricane", "flooding", "flood", "drought",
+  "tornado", "storm surge", "extreme weather",
+  "storm", "cyclone", "blizzard", "typhoon"
+)
+
+count_kw <- function(text, keywords) {
+  text_lower <- tolower(text)
+  sum(sapply(keywords, function(kw) str_count(text_lower, fixed(kw))))
+}
+
+scored_df <- df %>%
+  rowwise() %>%
+  mutate(
+    climate_hits = count_kw(cc_segment, climate_keywords),
+    weather_hits = count_kw(cc_segment, weather_keywords),
+    attribution_score = climate_hits * weather_hits,
+    word_count = str_count(cc_segment, "\\S+"),
+    attr_score_norm = round(attribution_score / word_count * 100, 3)
+  ) %>%
+  ungroup()
+```
+
+### 5.1 - Build Document-Term Matrix
+
+```{r build-dtm}
+dtm <- tidy_tokens %>%
+  count(doc_id, word) %>%
+  group_by(word) %>%
+  filter(sum(n) > 1) %>%  # remove terms appearing only once
+  ungroup() %>%
+  cast_dtm(document = doc_id, term = word, value = n)
+
+# Remove empty documents
+dtm <- dtm[rowSums(as.matrix(dtm)) > 0, ]
+
+cat("\nDTM dimensions (docs x terms):", dim(dtm), "\n")
+```
+
+### 5.2 - Model Selection: Tune K
+
+```{r lda-tune-k, fig.width=7, fig.height=4}
+set.seed(42)
+n_docs <- nrow(dtm)
+train_idx <- sample(1:n_docs, floor(0.8 * n_docs))
+dtm_train <- dtm[train_idx, ]
+dtm_test  <- dtm[-train_idx, ]
+
+cat(sprintf("\nTrain docs: %d | Test docs: %d\n",
+            nrow(dtm_train), nrow(dtm_test)))
+
+k_values <- c(3, 4, 5, 6, 7, 8)
+
+cat("\n-- LDA Model Selection: Perplexity by K --\n")
+perplexity_scores <- sapply(k_values, function(k) {
+  model <- LDA(dtm_train, k = k, method = "Gibbs",
+               control = list(seed = 42, burnin = 100, iter = 500))
+  p <- perplexity(model, newdata = dtm_test)
+  cat(sprintf("  K = %d -> perplexity = %.2f\n", k, p))
+  p
+})
+
+perplexity_df <- data.frame(k = k_values, perplexity = perplexity_scores)
+
+# Plot perplexity curve
+ggplot(perplexity_df, aes(x = k, y = perplexity)) +
+  geom_line(color = "#2c7bb6", linewidth = 1.2) +
+  geom_point(size = 4, color = "#2c7bb6") +
+  geom_text(aes(label = round(perplexity, 1)),
+            vjust = -1, size = 3.5) +
+  labs(
+    title = "LDA Model Selection: Perplexity by Number of Topics (K)",
+    subtitle = "80/20 train-test split | Lower perplexity = better fit | Select K at elbow",
+    x = "Number of Topics (K)", y = "Perplexity"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave("lda_perplexity.png", width = 7, height = 4, dpi = 150)
+```
+
+### 5.3 - Fit Final Model with Best K
+
+```{r lda-final-model}
+best_k <- 6  # <-- update after inspecting perplexity plot
+cat(sprintf("\nFitting final LDA model with K = %d...\n", best_k))
+
+lda_final <- LDA(dtm, k = best_k, method = "Gibbs",
+                  control = list(seed = 42, burnin = 200, iter = 1000))
+```
+
+### 5.4 - Inspect Top Terms per Topic
+
+```{r lda-top-terms, fig.width=12, fig.height=7}
+top_terms <- tidy(lda_final, matrix = "beta") %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup()
+
+cat("\n-- Top 10 Terms per Topic --\n")
+print(top_terms, n = Inf)
+
+# Plot top terms
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ paste("Topic", topic), scales = "free_y") +
+  scale_y_reordered() +
+  labs(
+    title = "Top Terms per LDA Topic",
+    subtitle = paste0("K = ", best_k, " topics | Gibbs sampling | 1000 iterations"),
+    x = "Beta (word-topic probability)", y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+ggsave("lda_top_terms.png", width = 12, height = 7, dpi = 150)
+```
+
+### 5.5 - Assign Dominant Topic to Each Article
+
+```{r assign-dominant-topic}
+doc_topics <- tidy(lda_final, matrix = "gamma") %>%
+  rename(doc_id = document) %>%
+  mutate(doc_id = as.integer(doc_id)) %>%
+  group_by(doc_id) %>%
+  slice_max(gamma, n = 1) %>%
+  ungroup() %>%
+  rename(dominant_topic = topic, topic_prob = gamma)
+
+df <- df %>%
+  left_join(doc_topics, by = "doc_id")
+
+cat("\nDominant topic distribution:\n")
+print(table(df$dominant_topic))
+```
+
+### 5.6 - Topic Distribution by Outlet
+
+```{r topic-labels-colors}
+topic_labels <- c(
+  "1" = "Wildfire & Flood Events",
+  "2" = "Climate & Heat Coverage",
+  "3" = "Hurricane Disaster Response",
+  "4" = "Storm & Hurricane Tracking",
+  "5" = "Community Impact & Damage",
+  "6" = "Political Coverage"
+)
+
+# df <- df %>%
+#   mutate(topic_label = recode(as.character(dominant_topic),
+#                                !!!topic_labels))
+
+df <- df %>%
+  mutate(topic_label = case_match(
+    dominant_topic,
+    1 ~ "Wildfire & Flood Events",
+    2 ~ "Climate & Heat Coverage",
+    3 ~ "Hurricane Disaster Response",
+    4 ~ "Storm & Hurricane Tracking",
+    5 ~ "Community Impact & Damage",
+    6 ~ "Political Coverage"
+  ))
+
+outlet_colors_8 <- c(
+  "CNN" = "#CC0000",
+  "Fox News" = "#E8563B",
+  "MSNBC" = "#4A90D9",
+  "NBC News" = "#F4C300",
+  "ABC News" = "#003DA5",
+  "CBS News" = "#D4A017",
+  "NewsNation" = "#8B5CF6",
+  "Sky News Australia" = "#0EA5E9"
+)
+
+topic_outlet <- df %>%
+  filter(!is.na(dominant_topic)) %>%
+  count(channelTitle, topic_label) %>%
+  group_by(channelTitle) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+```
+
+```{r topic-outlet-stacked-bar, fig.width=11, fig.height=6}
+# Plot A: Stacked bar
+ggplot(topic_outlet,
+       aes(x = channelTitle, y = pct, fill = topic_label)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.0f%%", pct)),
+            position = position_stack(vjust = 0.5),
+            size = 3, color = "white", fontface = "bold") +
+  labs(
+    title = "Topic Distribution by Outlet",
+    subtitle = paste("Dominant LDA topic per article | K =", best_k),
+    x = NULL, y = "% of Articles", fill = "Topic"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("topic_distribution_by_outlet.png", width = 11, height = 6, dpi = 150)
+```
+
+```{r topic-outlet-heatmap, fig.width=10, fig.height=6}
+# Plot B: Heatmap
+ggplot(topic_outlet,
+       aes(x = channelTitle, y = topic_label, fill = pct)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.1f%%", pct)), size = 3.2) +
+  scale_fill_gradient(low = "white", high = "#2166ac") +
+  labs(
+    title = "Topic-Outlet Heatmap",
+    subtitle = "Cell = % of that outlet's articles assigned to each topic",
+    x = NULL, y = NULL, fill = "% articles"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("topic_outlet_heatmap.png", width = 10, height = 6, dpi = 150)
+```
+
+# STEP 6 - SENTIMENT ANALYSIS
+
+```{r sentiment-scores}
+# 6.1 - COMPUTE SENTIMENT SCORES
+cat("\nComputing sentiment scores...\n")
+
+sentiment_scores <- df %>%
+  mutate(
+    sentiment_result = map(cc_segment,
+                            ~ sentiment_by(get_sentences(.x))),
+    mean_sentiment = map_dbl(sentiment_result,
+                              ~ mean(.x$ave_sentiment, na.rm = TRUE)),
+    sd_sentiment   = map_dbl(sentiment_result,
+                              ~ sd(.x$ave_sentiment, na.rm = TRUE))
+  ) %>%
+  select(doc_id, channelTitle, title, dominant_topic,
+         topic_label, mean_sentiment, sd_sentiment)
+
+# Summary table by outlet
+sentiment_summary <- sentiment_scores %>%
+  group_by(channelTitle) %>%
+  summarise(
+    n = n(),
+    mean_sent = round(mean(mean_sentiment, na.rm = TRUE), 3),
+    median_sent = round(median(mean_sentiment, na.rm = TRUE), 3),
+    sd_sent = round(sd(mean_sentiment, na.rm = TRUE), 3),
+    pct_positive = round(mean(mean_sentiment > 0.05) * 100, 1),
+    pct_negative = round(mean(mean_sentiment < -0.05) * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_sent))
+
+cat("\n-- Sentiment Summary by Outlet --\n")
+print(sentiment_summary)
+```
+
+### Plot A: Violin + Jitter
+
+```{r sentiment-violin, fig.width=9, fig.height=7}
+ggplot(sentiment_scores,
+       aes(x = reorder(channelTitle, mean_sentiment, median),
+           y = mean_sentiment, fill = channelTitle)) +
+  geom_violin(alpha = 0.5, trim = FALSE) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white") +
+  geom_jitter(aes(color = channelTitle),
+              width = 0.15, size = 1.8, alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = outlet_colors_8) +
+  scale_color_manual(values = outlet_colors_8) +
+  coord_flip() +
+  labs(
+    title = "Sentiment Distribution by Outlet",
+    subtitle = "Sentence-level sentiment averaged per article (sentimentr) | Dashed = neutral",
+    x = NULL, y = "Mean Sentiment Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+ggsave("sentiment_violin.png", width = 9, height = 7, dpi = 150)
+```
+
+### Plot B: Framing Tone Stacked Bar
+
+```{r sentiment-framing-bar, fig.width=10, fig.height=6}
+framing_df <- sentiment_scores %>%
+  mutate(
+    frame = case_when(
+      mean_sentiment >  0.05 ~ "Positive",
+      mean_sentiment < -0.05 ~ "Negative",
+      TRUE                   ~ "Neutral"
+    ),
+    frame = factor(frame, levels = c("Positive", "Neutral", "Negative"))
+  ) %>%
+  count(channelTitle, frame) %>%
+  group_by(channelTitle) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup()
+
+ggplot(framing_df,
+       aes(x = channelTitle, y = pct, fill = frame)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.0f%%", pct)),
+            position = position_stack(vjust = 0.5),
+            size = 3.5, color = "white", fontface = "bold") +
+  scale_fill_manual(values = c(
+    "Positive" = "#2ecc71",
+    "Neutral"  = "#bdc3c7",
+    "Negative" = "#e74c3c"
+  )) +
+  labs(
+    title = "Framing Tone by Outlet",
+    subtitle = "Positive > 0.05 | Neutral = +/-0.05 | Negative < -0.05",
+    x = NULL, y = "% of Articles", fill = "Tone"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("sentiment_framing_bar.png", width = 10, height = 6, dpi = 150)
+```
+
+### Plot C: Mean Sentiment Bar
+
+```{r sentiment-mean-bar, fig.width=9, fig.height=6}
+sentiment_summary %>%
+  ggplot(aes(x = reorder(channelTitle, mean_sent),
+             y = mean_sent, fill = channelTitle)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = round(mean_sent, 3)),
+            hjust = -0.2, size = 3.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = outlet_colors_8) +
+  coord_flip() +
+  expand_limits(y = max(abs(sentiment_summary$mean_sent)) * 1.4) +
+  labs(
+    title = "Mean Sentiment Score by Outlet",
+    subtitle = "Higher = more positive framing on average",
+    x = NULL, y = "Mean Sentiment Score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+ggsave("sentiment_mean_bar.png", width = 9, height = 6, dpi = 150)
+```
+
+### Plot D: Sentiment by Topic per Outlet
+
+```{r sentiment-by-topic, fig.width=14, fig.height=8}
+sentiment_scores %>%
+  filter(!is.na(topic_label)) %>%
+  group_by(channelTitle, topic_label) %>%
+  filter(n() >= 3) %>%
+  ungroup() %>%
+  ggplot(aes(x = topic_label, y = mean_sentiment, fill = channelTitle)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(aes(color = channelTitle),
+              width = 0.2, size = 1.5, alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = outlet_colors_8) +
+  scale_color_manual(values = outlet_colors_8) +
+  facet_wrap(~ channelTitle, scales = "free_x") +
+  labs(
+    title = "Sentiment by Topic and Outlet",
+    subtitle = "Topic-outlet groups with 3+ articles only",
+    x = NULL, y = "Mean Sentiment Score"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 35, hjust = 1))
+
+ggsave("sentiment_by_topic.png", width = 14, height = 8, dpi = 150)
+```
+
+# PART 6b - JOINT ANALYSIS: SENTIMENT x CLIMATE ATTRIBUTION
+
+```{r joint-analysis-correlation}
+joint_df <- scored_df %>%
+  select(doc_id, channelTitle, attribution_score,
+         attr_score_norm, climate_hits, weather_hits) %>%
+  left_join(sentiment_scores, by = c("doc_id", "channelTitle"))
+
+# 6b.1 - CORRELATION TEST PER OUTLET
+cat("\n-- Pearson Correlation: Attribution Score vs Sentiment --\n")
+joint_df %>%
+  group_by(channelTitle) %>%
+  filter(n() >= 5) %>%  # need at least 5 for correlation
+  summarise(
+    r = round(cor(attr_score_norm, mean_sentiment, use = "complete.obs"), 3),
+    p_value = round(cor.test(attr_score_norm, mean_sentiment)$p.value, 4),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(r) %>%
+  print()
+```
+
+### Plot E: Faceted Scatter by Outlet
+
+```{r joint-faceted-scatter, fig.width=14, fig.height=8}
+ggplot(joint_df,
+       aes(x = attr_score_norm, y = mean_sentiment)) +
+  geom_point(aes(color = channelTitle), size = 2.5, alpha = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey30", linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60") +
+  scale_color_manual(values = outlet_colors_8) +
+  facet_wrap(~ channelTitle, scales = "free_x") +
+  labs(
+    title = "Sentiment vs. Attribution Score (Faceted by Outlet)",
+    subtitle = "Positive sentiment above dashed line | Stronger climate attribution to the right",
+    x = "Normalized Attribution Score",
+    y = "Mean Sentiment Score"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+ggsave("sentiment_attribution_facet.png", width = 14, height = 8, dpi = 150)
+```
+
+### Plot F: High vs Low Attribution Sentiment
+
+```{r joint-high-low-attribution, fig.width=11, fig.height=6}
+joint_df %>%
+  mutate(
+    attr_group = ifelse(
+      attr_score_norm > median(attr_score_norm, na.rm = TRUE),
+      "High Attribution", "Low Attribution"
+    )
+  ) %>%
+  group_by(channelTitle, attr_group) %>%
+  summarise(mean_sent = mean(mean_sentiment, na.rm = TRUE),
+            .groups = "drop") %>%
+  ggplot(aes(x = channelTitle, y = mean_sent, fill = attr_group)) +
+  geom_col(position = "dodge", width = 0.65) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = c(
+    "High Attribution" = "#2c7bb6",
+    "Low Attribution"  = "#d7191c"
+  )) +
+  labs(
+    title = "Mean Sentiment: High vs Low Climate Attribution Articles",
+    subtitle = "Split at median normalized attribution score across full corpus",
+    x = NULL, y = "Mean Sentiment Score", fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave("sentiment_high_low_attribution.png", width = 11, height = 6, dpi = 150)
+```
